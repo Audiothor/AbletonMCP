@@ -6,6 +6,75 @@ def register_tools(mcp, get_conn):
     """Module de base : Fournit des raccourcis simples à Claude."""
 
     @mcp.tool()
+    def batch_multiple_ableton_actions(actions: List[Dict[str, Any]]) -> str:
+        """
+        ⚠️ ATTENTION : Si tu as PLUSIEURS actions à faire à la suite, tu DOIS utiliser cet outil.
+        
+        Exécute une série de commandes Ableton en une seule fois (Macro).
+        Commandes supportées : "load_device" (ou "load_instrument"), "add_midi_notes", "clear_midi_notes", "delete_device", "create_clip", "set_tempo", "rename_track".
+        
+        REGLE IMPORTANTE : Si tu veux charger un instrument ou créer un clip MIDI, ASSURE-TOI d'abord que la piste est bien une piste MIDI, sinon Ableton rejettera la commande !
+        """
+        results = []
+        for i, action in enumerate(actions):
+            cmd = action.get("command")
+            p = action.get("params", {})
+            
+            # --- CORRECTION DU SYNONYME ---
+            if cmd == "load_instrument":
+                cmd = "load_device"
+                
+            try:
+                if cmd == "create_clip":
+                    path = f"song.tracks[{p['track_index']}].clip_slots[{p['clip_index']}].create_clip"
+                    res = get_conn().send_command("universal_accessor", {"action": "call", "path": path, "value": float(p.get('length', 4.0))})
+                
+                elif cmd == "set_tempo":
+                    res = get_conn().send_command("universal_accessor", {"action": "set", "path": "song.tempo", "value": float(p.get('tempo', 120.0))})
+                
+                elif cmd == "rename_track":
+                    path = f"song.tracks[{p['track_index']}].name"
+                    res = get_conn().send_command("universal_accessor", {"action": "set", "path": path, "value": str(p.get('name', 'Piste'))})
+
+                elif cmd == "load_device":
+                    track_idx = p.get('track_index')
+                    path_devs = f"song.tracks[{track_idx}].devices"
+                    
+                    devs_before = get_conn().send_command("universal_accessor", {"action": "get", "path": path_devs})
+                    count_before = len(devs_before) if isinstance(devs_before, list) else 0
+                    
+                    res = get_conn().send_command(cmd, p)
+                    
+                    if "Loaded" in str(res):
+                        timeout = 10.0
+                        start_time = time.time()
+                        loaded = False
+                        while time.time() - start_time < timeout:
+                            devs_now = get_conn().send_command("universal_accessor", {"action": "get", "path": path_devs})
+                            count_now = len(devs_now) if isinstance(devs_now, list) else 0
+                            if count_now > count_before:
+                                loaded = True
+                                break
+                            time.sleep(0.5)
+                        if loaded: res += " [Vérification : Succès]"
+                        else: res += " [Vérification : Timeout]"
+
+                elif cmd in ["add_midi_notes", "clear_midi_notes", "delete_device"]:
+                    res = get_conn().send_command(cmd, p)
+                    
+                else:
+                    res = f"Commande ignorée: {cmd} n'est pas supportée dans la macro."
+                
+                results.append(f"[{i+1}/{len(actions)}] {cmd} : {res}")
+            except Exception as e:
+                # --- CORRECTION DE L'EFFET DOMINO ---
+                # On note l'erreur mais on ENLEVE le 'break' pour que la macro continue ses autres tâches !
+                results.append(f"[{i+1}/{len(actions)}] {cmd} ERREUR : {str(e)}")
+                continue 
+                
+        return "\n".join(results)
+        
+    @mcp.tool()
     def create_midi_track(index: int = -1) -> str:
         """Crée une nouvelle piste MIDI dans Ableton."""
         try:
@@ -106,14 +175,14 @@ def register_tools(mcp, get_conn):
     @mcp.tool()
     def load_instrument(track_index: int, instrument_name: str) -> str:
         """
+        ⚠️ ATTENTION : Pour toute suite de plusieurs actions (ex: créer des pistes, charger des instruments, ajouter des notes), N'UTILISE PAS cet outil individuellement. 
+        Utilise OBLIGATOIREMENT la macro 'batch_multiple_ableton_actions' ! La macro est spécialement programmée pour charger les instruments en toute sécurité.
+        
         Charge un instrument (Natif ou VST) sur une piste via le navigateur.
         
         REGLES MUSICALES ET TECHNIQUES OBLIGATOIRES :
-        1. DRUMS / BATTERIE : Ne demande JAMAIS "Drum Rack" (c'est un dossier, cela va planter). 
-           Tu DOIS demander EXACTEMENT l'un de ces kits natifs : 
-           "808 Core Kit", "909 Core Kit", "707 Core Kit", "505 Core Kit".
+        1. DRUMS / BATTERIE : Ne demande JAMAIS "Drum Rack" (c'est un dossier). Demande EXACTEMENT : "808 Core Kit", "909 Core Kit", "707 Core Kit", ou "505 Core Kit".
         2. SYNTHES : Utilise "Analog", "Wavetable", "Operator", "Tension", ou "Impulse".
-        3. TIMING : Charge les instruments STRICTEMENT UN PAR UN. Attends la reponse avant le suivant.
         """
         try:
             res = get_conn().send_command("load_device", {"track_index": track_index, "device_name": instrument_name})

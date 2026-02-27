@@ -17,3 +17,6 @@ crash_log.txt
 
 # Fichiers AbletonMCP
 __init__.py.upgrade1
+
+# Global
+.vscode/settings.json
