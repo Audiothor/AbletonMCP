@@ -1,0 +1,19 @@
+# Dépendances (très lourd, ne pas envoyer sur GitHub)
+node_modules/
+__pycache__/
+*.pyc
+venv/
+
+# Fichiers temporaires Ableton ou OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Fichiers ableton_mcp-server
+server.py.original
+server.py.upgrade1
+server.py.upgrade2
+crash_log.txt
+
+# Fichiers AbletonMCP
+__init__.py.upgrade1
