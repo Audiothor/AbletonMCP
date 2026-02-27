@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ableton-live": {
+      "command": "C:\\Users\\comme\\Documents\\GitHub\\AbletonMCP\\ableton-mcp-server\\venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\comme\\Documents\\GitHub\\AbletonMCP\\ableton-mcp-server\\server.py"
+      ]
+    }
+  },
+  "preferences": {
+    "coworkScheduledTasksEnabled": false,
+    "sidebarMode": "chat",
+    "coworkWebSearchEnabled": true
+  }
+}
