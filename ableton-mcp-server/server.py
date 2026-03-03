@@ -1,5 +1,5 @@
-# server.py
-from mcp.server.fastmcp import FastMCP, Context
+# ableton-mcp-server/server.py
+from mcp.server.fastmcp import FastMCP
 import socket
 import json
 import logging
@@ -9,15 +9,15 @@ import importlib
 import threading
 import sys
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 # --- INFORMATIONS DU PROGRAMME ---
 APP_NAME = "AbletonMCP Server"
-VERSION = "5.1.0"
+VERSION = "5.2.1"
 APP_AUTHOR = "François SENELLART"
 DEBUG_MODE = False
 
-# Configuration logging stricte sur stderr pour ne jamais faire planter Claude
+# Configuration logging
 log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
 logging.basicConfig(
     level=log_level, 
@@ -26,107 +26,89 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AbletonUniversalServer")
 
-# --- FIX DU DOSSIER DE TRAVAIL ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+
+# --- VERROU GLOBAL RÉSEAU ---
+# Empêche Claude d'envoyer deux ordres en même temps dans le même socket
+_ableton_lock = threading.Lock()
 
 @dataclass
 class AbletonConnection:
     host: str
     port: int
-    sock: Optional[socket.socket] = None
     
     def check_connection(self) -> bool:
-        """Vérifie si la connexion est réellement vivante côté Ableton."""
-        if not self.sock:
-            return False
+        """Vérifie si le Remote Script est actif."""
         try:
-            # PING FANTÔME : On envoie un simple saut à la ligne.
-            # Si Ableton a été fermé, cela déclenchera immédiatement une erreur.
-            # S'il est ouvert, le script d'Ableton ignorera ce caractère vide.
-            self.sock.sendall(b'\n')
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect((self.host, self.port))
+            s.close()
             return True
-        except (socket.error, BrokenPipeError, ConnectionResetError):
-            self.sock = None
-            return False
-
-    def connect(self) -> bool:
-        if self.check_connection(): 
-            return True
-            
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return True
-        except Exception:
-            self.sock = None
+        except:
             return False
 
     def receive_full_response(self, sock, buffer_size=8192):
+        """Lit la réponse JSON complète envoyée par Ableton."""
         chunks = []
-        sock.settimeout(15.0)
-        try:
-            while True:
+        sock.settimeout(5.0)
+        while True:
+            try:
+                chunk = sock.recv(buffer_size)
+                if not chunk: break 
+                chunks.append(chunk)
                 try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk: raise Exception("Connection closed")
-                    chunks.append(chunk)
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        return data
-                    except json.JSONDecodeError: continue
-                except socket.timeout:
-                    break
-                except Exception as e:
-                    raise e
-        except Exception as e:
-            raise e
+                    data = b''.join(chunks)
+                    json.loads(data.decode('utf-8'))
+                    return data
+                except json.JSONDecodeError: 
+                    continue
+            except socket.timeout: 
+                break
+            except Exception: 
+                break
             
-        if chunks:
-            data = b''.join(chunks)
-            return data
-        else: raise Exception("No data")
+        if chunks: 
+            return b''.join(chunks)
+        raise Exception("Aucune donnée reçue d'Ableton")
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        if not self.sock and not self.connect():
-            raise ConnectionError("Non connecté à Ableton")
-        
-        command = {"type": command_type, "params": params or {}}
-        start_time = time.time()
-        
-        is_modifying = command_type in ["add_midi_notes", "load_device", "universal_accessor", "set_device_param", "add_automation"]
-        
-        try:
-            if command_type == "universal_accessor":
-                logger.debug(f"🔍 [LOM EXEC] {params.get('action', '').upper()} -> {params.get('path', '')}")
-            elif command_type != "get_session_info":
-                logger.debug(f"📤 [CMD] {command_type} | Params: {json.dumps(params)}")
+        """Envoie une commande unique et sécurisée au Remote Script."""
+        with _ableton_lock:
+            # SÉCURITÉ ANTI-NONE : On vérifie que la commande a un nom
+            if not command_type:
+                logger.error("Tentative d'envoi d'une commande vide (None)")
+                raise ValueError("Le type de commande ne peut pas être vide")
+
+            command = {"type": str(command_type), "params": params or {}}
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0) # Temps suffisant pour les actions lourdes
+            try:
+                sock.connect((self.host, self.port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            if is_modifying: time.sleep(0.1)
-            
-            self.sock.settimeout(35.0 if command_type == "load_device" else 15.0)
-            
-            response_data = self.receive_full_response(self.sock)
-            response = json.loads(response_data.decode('utf-8'))
-            execution_time = (time.time() - start_time) * 1000
-            
-            if response.get("status") == "error":
-                logger.error(f"🔴 ERREUR ABLETON : {response.get('message')}")
-                raise Exception(response.get("message"))
-            
-            if command_type != "get_session_info":
-                logger.debug(f"📥 [REPONSE] ({execution_time:.1f}ms) | Taille: {len(response_data)} bytes")
-            
-            if is_modifying: time.sleep(0.1)
-            return response.get("result", {})
-            
-        except Exception as e:
-            logger.error(f"💥 Erreur de communication : {str(e)}")
-            self.sock = None
-            raise e
+                # Logging de la commande sortante
+                if command_type != "get_session_info":
+                    logger.info(f"📤 [ENVOI] {command_type} | Piste: {params.get('track_index', '?')}")
+                
+                sock.sendall(json.dumps(command).encode('utf-8'))
+                
+                # Récupération de la réponse
+                response_data = self.receive_full_response(sock)
+                response = json.loads(response_data.decode('utf-8'))
+                
+                if response.get("status") == "error":
+                    raise Exception(response.get("message"))
+                
+                return response.get("result", response)
+                
+            except Exception as e:
+                logger.error(f"💥 Erreur de communication Ableton : {str(e)}")
+                raise e
+            finally:
+                sock.close()
 
 # --- INITIALISATION MCP ---
 mcp = FastMCP("AbletonMCP_Modular")
@@ -138,7 +120,7 @@ def get_conn():
         _connection = AbletonConnection(host="localhost", port=9877)
     return _connection
 
-# --- OUTILS CORE (Système global) ---
+# --- OUTILS CORE ---
 @mcp.tool()
 def access_lom(action: str, path: str, value_json_str: Optional[str] = None) -> str:
     """Accès universel au Live Object Model (LOM)."""
@@ -147,51 +129,33 @@ def access_lom(action: str, path: str, value_json_str: Optional[str] = None) -> 
         res = get_conn().send_command("universal_accessor", {"action": action, "path": path, "value": actual_val})
         return json.dumps(res, indent=2)
     except Exception as e:
-        if value_json_str:
-            res = get_conn().send_command("universal_accessor", {"action": action, "path": path, "value": value_json_str})
-            return json.dumps(res, indent=2)
         return f"Erreur LOM: {e}"
 
 @mcp.tool()
 def get_session_info() -> str:
-    """Résumé rapide de la session."""
+    """Résumé rapide de la session Ableton."""
     try:
         return json.dumps(get_conn().send_command("get_session_info"), indent=2)
     except Exception as e:
         return str(e)
 
-
-# --- BOUCLE DE SURVEILLANCE DE LA CONNEXION ---
+# --- BOUCLE DE SURVEILLANCE ---
 def connection_monitor():
-    """Vérifie l'état de la connexion et logue intelligemment."""
     conn = get_conn()
     was_connected = False
-    
     while True:
         is_connected = conn.check_connection()
-        
-        if not is_connected:
-            is_connected = conn.connect()
-        
-        if is_connected:
-            if not was_connected:
-                # N'affiche le message de succès qu'une seule fois quand la connexion est établie
-                logger.info(f"✅ Succès : Le remote script AbletonMCP est joignable (Port {conn.port})")
-                was_connected = True
-        else:
-            if was_connected:
-                # Si on était connecté et qu'on perd la connexion
-                logger.error(f"❌ ALERTE : Perte de connexion avec AbletonMCP sur le port {conn.port} ! Le logiciel a-t-il été fermé ?")
-                was_connected = False
-            
-            # Boucle toutes les 5s UNIQUEMENT quand ce n'est pas joignable
-            logger.warning(f"⏳ En attente du remote script AbletonMCP sur le port {conn.port}...")
-            
+        if is_connected and not was_connected:
+            logger.info(f"✅ Remote Script AbletonMCP détecté sur le port {conn.port}")
+            was_connected = True
+        elif not is_connected and was_connected:
+            logger.warning("⚠️ Connexion perdue avec Ableton")
+            was_connected = False
         time.sleep(5)
 
 # --- CHARGEMENT DYNAMIQUE DES MODULES ---
 def load_modules():
-    logger.info("📦 Recherche et chargement des modules...")
+    logger.info("📦 Chargement des modules de fonctionnalités...")
     modules_dir = os.path.join(BASE_DIR, "modules")
     
     if not os.path.exists(modules_dir):
@@ -206,40 +170,21 @@ def load_modules():
                 module = importlib.import_module(f"modules.{module_name}")
                 if hasattr(module, "register_tools"):
                     module.register_tools(mcp, get_conn)
-                    logger.info(f"  ↳ ✅ Module chargé : {module_name}")
+                    logger.info(f"  ↳ ✅ {module_name}")
                     loaded += 1
-                else:
-                    logger.warning(f"  ↳ ⚠️ Ignoré : {module_name} (Il manque 'register_tools')")
             except Exception as e:
-                logger.error(f"  ↳ ❌ Erreur de chargement pour {module_name}: {str(e)}")
-                
-    logger.info(f"🏁 Serveur prêt ! ({loaded} modules externes chargés)")
-
+                logger.error(f"  ↳ ❌ Erreur dans {module_name}: {str(e)}")
+    logger.info(f"🏁 Serveur MCP prêt ({loaded} modules)")
 
 def main():
-    # 1. Bannière de démarrage
-    logger.info("="*55)
-    logger.info(f"🎵  {APP_NAME} - v{VERSION}")
-    logger.info(f"    Licence MIT")
-    logger.info(f"    Copyright (c) 2026 {APP_AUTHOR}")
-    if DEBUG_MODE:
-        logger.info("    [!] MODE DEBUG ACTIF")
-    logger.info("="*55)
-    
-    logger.info("🚀 Démarrage de AbletonMCP server...")
-    
-    # 2. Chargement des modules
     load_modules()
-    
-    # 3. Lancement du thread de surveillance réseau
     monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
     monitor_thread.start()
     
-    # 4. Lancement du serveur MCP
     try:
         mcp.run()
     except Exception as e:
-        logger.error(f"💥 Erreur fatale MCP : {e}")
+        logger.error(f"💥 Erreur fatale : {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

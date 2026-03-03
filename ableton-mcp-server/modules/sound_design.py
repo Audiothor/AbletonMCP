@@ -11,21 +11,16 @@ def register_tools(mcp, get_conn):
     
     @mcp.tool()
     def add_audio_effect(track_index: int, effect_name: str) -> str:
-        """
-        Charge un effet audio natif Ableton sur une piste.
-        Exemples d'effect_name: "Auto Filter", "Reverb", "Delay", "EQ Eight", "Compressor", "Utility".
-        """
-        logger.info(f"🎛️ Chargement de l'effet '{effect_name}' sur la piste {track_index}")
+        """Charge un effet audio natif Ableton."""
         try:
             conn = get_conn()
-            # On réutilise la fonction load_device qui cherche déjà dans les Audio Effects
+            # On doit s'assurer que "load_device" est écrit en DUR ici
             res = conn.send_command("load_device", {
                 "track_index": track_index,
                 "device_name": effect_name
             })
-            return f"Résultat de l'ajout de l'effet : {res}"
+            return f"Résultat : {res}"
         except Exception as e:
-            logger.error(f"Erreur lors de l'ajout de l'effet : {str(e)}")
             return f"Erreur : {str(e)}"
 
     @mcp.tool()

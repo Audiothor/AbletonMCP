@@ -15,8 +15,10 @@ class AbletonMCP(ControlSurface):
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
         self.log_message("==============================================")
-        self.log_message("   AbletonMCP V13 - SAMPLE LOADER ENABLED     ")
+        self.log_message("   AbletonMCP V26 - FINAL C++ & LOM FIX       ")
         self.log_message("==============================================")
+        self._task_queue = queue.Queue()
+        self._is_processing = False
         self.running = True
         self.start_server()
 
@@ -33,339 +35,161 @@ class AbletonMCP(ControlSurface):
             self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server.bind((HOST, DEFAULT_PORT))
             self.server.listen(5)
-            t = threading.Thread(target=self._server_thread)
+            t = threading.Thread(target=self._listen)
             t.daemon = True
             t.start()
-        except Exception as e: self.log_message("Server Error: " + str(e))
+        except: self.log_message("Server Error: " + traceback.format_exc())
 
-    def _server_thread(self):
-        self.server.settimeout(1.0)
+    def _listen(self):
         while self.running:
             try:
-                client, _ = self.server.accept()
-                threading.Thread(target=self._handle_client, args=(client,)).start()
-            except socket.timeout: continue
+                conn, addr = self.server.accept()
+                data = conn.recv(65536)
+                if data:
+                    try:
+                        req = json.loads(data.decode('utf-8'))
+                        self._process_request(conn, req)
+                    except: conn.close()
+                else: conn.close()
+            except: pass
 
-    def _handle_client(self, client):
-        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        buffer = ''
+    def _process_request(self, conn, req):
+        cmd_type = req.get("type") or req.get("command")
+        params = req.get("params", {})
         try:
-            while self.running:
-                data = client.recv(8192)
-                if not data: break
-                try: buffer += data.decode('utf-8')
-                except: buffer += data
-                try:
-                    cmd = json.loads(buffer)
-                    buffer = ''
-                    resp = self._process_command(cmd)
-                    res_json = json.dumps(resp)
-                    try: client.sendall(res_json.encode('utf-8'))
-                    except: client.sendall(res_json)
-                except ValueError: continue
-        except Exception as e:
-            self.log_message("Client Error: " + str(e))
-        finally: 
-            client.close()
+            conn.sendall(json.dumps({"status": "queued"}).encode('utf-8'))
+            conn.close()
+        except: pass
+        if cmd_type:
+            params["_retry_count"] = 0
+            self._task_queue.put((cmd_type, params))
+            if not self._is_processing:
+                self._is_processing = True
+                self.schedule_message(1, self._process_queue)
 
-    def _process_command(self, command):
-        cmd_type = command.get("type", "")
-        params = command.get("params", {})
+    def _process_queue(self):
+        if self._task_queue.empty():
+            self._is_processing = False
+            return
+        cmd_type, params = self._task_queue.get()
+        try:
+            # FIX FOCUS : Toujours convertir l'index en objet Track pour éviter l'erreur C++
+            t_idx = params.get("track_index")
+            if t_idx is not None:
+                all_tracks = list(self.song().tracks) + list(self.song().return_tracks) + [self.song().master_track]
+                if t_idx < len(all_tracks):
+                    target = all_tracks[t_idx]
+                    if self.song().view.selected_track != target:
+                        self.song().view.selected_track = target
+                        self._task_queue.put((cmd_type, params))
+                        self.schedule_message(2, self._process_queue)
+                        return
+
+            if cmd_type == "load_device": self._load_device_by_name(params)
+            elif cmd_type == "load_sample": self._load_sample(params)
+            elif cmd_type == "universal_accessor": self._universal_accessor(params)
+            elif cmd_type == "add_midi_notes": self._add_midi_notes(params)
+            elif cmd_type == "set_device_param": self._set_device_param_by_name(params)
+            self.log_message("(AbletonMCP) Done: " + str(cmd_type))
+        except Exception as e: self.log_message("(AbletonMCP) Error: " + str(e))
+        self.schedule_message(5, self._process_queue)
+
+    def _universal_accessor(self, params):
+        action, path_str, value = params.get("action"), params.get("path", ""), params.get("value")
         
-        self.log_message("--- EXECUTION: " + cmd_type + " ---")
-        
-        res_q = queue.Queue()
-        def task():
+        # SÉCURITÉ C++ SIGNATURE : Correction immédiate du chemin si c'est un focus de piste
+        if "selected_track" in path_str and action == "set":
             try:
-                if cmd_type == "universal_accessor": res = self._navigate_and_execute(params)
-                elif cmd_type == "load_device": res = self._load_device_by_name(params)
-                elif cmd_type == "load_sample": res = self._load_sample(params)
-                elif cmd_type == "delete_device": res = self._delete_device(params)
-                elif cmd_type == "add_midi_notes": res = self._add_midi_notes(params)
-                elif cmd_type == "read_midi_notes": res = self._read_midi_notes(params)
-                elif cmd_type == "clear_midi_notes": res = self._clear_midi_notes(params)
-                elif cmd_type == "set_device_param": res = self._set_device_param_by_name(params)
-                elif cmd_type == "add_automation": res = self._add_automation_by_name(params)
-                elif cmd_type == "get_session_info": res = {"tempo": self.song().tempo, "tracks": len(self.song().tracks)}
-                else: raise Exception("Unknown command: " + cmd_type)
-                res_q.put({"status": "success", "result": res})
-            except Exception as e: 
-                err_msg = str(e) + "\n" + traceback.format_exc()
-                self.log_message("Command Error: " + err_msg)
-                res_q.put({"status": "error", "message": str(e)})
-        self.schedule_message(0, task)
-        return res_q.get(timeout=15.0)
+                idx = int(value)
+                self.song().view.selected_track = self.song().tracks[idx]
+                return
+            except: pass
 
-    # --- SOUS-FONCTIONS DU LOM ---
-    def _navigate_and_execute(self, params):
-        action = params.get("action")
-        path_str = params.get("path", "")
-        value = params.get("value")
-        path_str = path_str.replace("live_set.", "song.").replace("live_set", "song")
-        path_str = re.sub(r'([a-zA-Z_]+)\s+(\d+)', r'\1[\2]', path_str) 
-        path_str = path_str.replace(" ", ".")
-        if "app.browser" in path_str or "application.browser" in path_str:
-            obj = self.application().browser
-            path_str = path_str.split("browser")[-1].strip(".")
-        elif path_str.startswith("application") or path_str.startswith("app"):
-            obj = self.application()
-            path_str = path_str.replace("application", "", 1).replace("app", "", 1).strip(".")
-        elif path_str.startswith("browser"):
-            obj = self.application().browser
-            path_str = path_str.replace("browser", "", 1).strip(".")
-        elif path_str.startswith("song"):
-            obj = self.song()
-            path_str = path_str.replace("song", "", 1).strip(".")
-        else:
-            obj = self.song()
-            
-        parts = [p for p in path_str.split(".") if p]
-        if not parts: return str(obj)
-
-        for part in parts[:-1]:
-            if "[" in part:
-                name, idx = part.split("[")[0], int(part.split("[")[1].replace("]", ""))
-                obj = getattr(obj, name)[idx]
-            else: obj = getattr(obj, part)
-        attr = parts[-1]
-        
-        if "[" in attr:
-            name, idx = attr.split("[")[0], int(attr.split("[")[1].replace("]", ""))
-            obj = getattr(obj, name)
-            if action == "get":
-                val = obj[idx]
-                return str(val.name) if hasattr(val, 'name') else str(val)
-        else:
-            if action == "get":
-                val = getattr(obj, attr)
-                try: 
-                    if isinstance(val, (str, unicode)): return val
-                except NameError:
-                    if isinstance(val, str): return val
-                if isinstance(val, (int, float, bool)): return val
-                if val is None: return None
-                return [str(i) for i in val] if hasattr(val, "__iter__") else str(val) if hasattr(val, 'name') else str(val)
-            elif action == "set": 
-                if hasattr(obj, "min") and hasattr(obj, "max") and isinstance(value, (int, float)):
-                    value = max(obj.min, min(obj.max, float(value)))
-                try:
-                    setattr(obj, attr, value)
-                except Exception as e:
-                    if isinstance(value, int): 
-                        try:
-                            setattr(obj, attr, float(value))
-                            return True
-                        except: pass
-                    raise Exception("Valeur invalide. Erreur : " + str(e))
-                return True
+        obj_data = self._navigate_and_execute(path_str)
+        if obj_data:
+            obj, attr = obj_data
+            if action == "set":
+                val = float(value) if hasattr(obj, "min") else value
+                setattr(obj, attr, val)
             elif action == "call":
-                m = getattr(obj, attr)
-                args = value if isinstance(value, list) else ([value] if value is not None else [])
-                res = m(*args)
-                if res is None: return True
-                if isinstance(res, (int, float, bool, str)): return res
-                try:
-                    if isinstance(res, unicode): return res
-                except NameError: pass
-                return str(res)
+                getattr(obj, attr)(value) if value is not None else getattr(obj, attr)()
 
-    def _add_midi_notes(self, params):
-        t_idx, c_idx = params.get("track_index"), params.get("clip_index")
-        notes_raw = params.get("notes", [])
-        track = self.song().tracks[t_idx]
-        if not track.clip_slots[c_idx].has_clip: return "Erreur : Aucun clip à cet emplacement."
-        clip = track.clip_slots[c_idx].clip
-        notes_to_add = []
-        for n in notes_raw:
-            start_val = n.get("start_time", n.get("start", n.get("time", 0.0)))
-            dur_val = n.get("duration", n.get("dur", n.get("length", 0.25)))
-            vel_val = n.get("velocity", n.get("vel", 100))
-            safe_vel = max(1, min(127, int(vel_val)))
-            note = Live.Clip.MidiNoteSpecification(
-                start_time=float(start_val), duration=float(dur_val),
-                pitch=int(n.get("pitch", 60)), velocity=safe_vel, mute=bool(n.get("mute", False))
-            )
-            notes_to_add.append(note)
-        clip.add_new_notes(tuple(notes_to_add))
-        return "Notes ajoutées avec succès"
-
-    def _read_midi_notes(self, params):
-        t_idx, c_idx = params.get("track_index"), params.get("clip_index")
-        track = self.song().tracks[t_idx]
-        if not track.clip_slots[c_idx].has_clip: return "Erreur : Aucun clip."
-        clip = track.clip_slots[c_idx].clip
-        result = []
-        try:
-            notes = clip.get_notes_extended(0, 128, 0.0, 99999.0)
-            for n in notes:
-                result.append({"pitch": n.pitch, "start": n.start_time, "dur": n.duration, "vel": n.velocity, "mute": n.mute})
-        except AttributeError:
-            notes = clip.get_notes(0.0, 0, 99999.0, 128)
-            for n in notes:
-                result.append({"pitch": int(n[0]), "start": float(n[1]), "dur": float(n[2]), "vel": int(n[3]), "mute": bool(n[4])})
-        return result
-
-    def _clear_midi_notes(self, params):
-        t_idx, c_idx = params.get("track_index"), params.get("clip_index")
-        track = self.song().tracks[t_idx]
-        if not track.clip_slots[c_idx].has_clip: return "Erreur : Aucun clip."
-        clip = track.clip_slots[c_idx].clip
-        try: clip.remove_notes_extended(0, 128, 0.0, 99999.0)
-        except AttributeError: clip.remove_notes(0.0, 0, 99999.0, 128)
-        return "Clip vidé avec succès."
-
-    def _delete_device(self, params):
-        t_idx = params.get("track_index")
-        device_name = params.get("device_name", "").lower()
-        track = self.song().tracks[t_idx]
-        deleted = False
-        for i in range(len(track.devices) - 1, -1, -1):
-            if device_name in track.devices[i].name.lower() or device_name == "all":
-                track.delete_device(i)
-                deleted = True
-        if deleted: return "Plugins supprimés avec succès."
-        return "Erreur : Plugin non trouvé sur cette piste."
+    def _navigate_and_execute(self, path_str):
+        path_str = path_str.replace("live_set", "song").replace(" ", ".")
+        path_str = re.sub(r'([a-zA-Z_]+)\.([\d]+)', r'\1[\2]', path_str)
+        obj = self.song() if path_str.startswith("song") else self
+        path_str = path_str.replace("song.", "").replace("song", "").strip(".")
+        parts = [p for p in path_str.split(".") if p]
+        curr = obj
+        for part in parts[:-1]:
+            try:
+                if "[" in part:
+                    name, key = part.split("[")[0], part.split("[")[1].replace("]", "").strip('"')
+                    coll = getattr(curr, name)
+                    curr = coll[int(key)] if key.isdigit() else next((x for x in coll if key.lower() in x.name.lower()), coll[0])
+                else: curr = getattr(curr, part)
+            except: return None
+        return (curr, parts[-1])
 
     def _load_device_by_name(self, params):
-        idx = params.get("track_index")
-        raw_name = params.get("device_name", "").lower()
-        for word in ["vsti", "vst3", "vst", "plugin", "audio unit", "au"]:
-            raw_name = raw_name.replace(word, "")
-        name = raw_name.strip()
+        name = str(params.get("device_name", "")).lower().strip()
+        browser = Live.Application.get_application().browser
         
-        if name in ["drum rack", "drums", "drumrack"]:
-            name = "909 core kit"
-            
-        browser = self.application().browser
-        categories = [
-            browser.instruments, browser.drums, browser.audio_effects, 
-            browser.plugins, browser.max_for_live
-        ]
-        
-        def find_item_exact(node):
-            if hasattr(node, 'is_loadable') and node.is_loadable and node.name.lower() == name: return node
+        # PRIORITÉ : Effets audio si on est sur une piste audio ou si le nom n'indique pas un instrument
+        is_kit = "kit" in name or "drum" in name
+        cats = [browser.audio_effects, browser.instruments, browser.drums, browser.packs]
+        if is_kit: cats = [browser.drums, browser.packs, browser.instruments]
+
+        def find_r(node, target):
+            if hasattr(node, 'is_loadable') and node.is_loadable:
+                n_name = node.name.lower()
+                if n_name.endswith(('.wav', '.aif', '.mp3')): return None
+                if target == n_name: return node # Match exact
+                if target in n_name: return node # Match partiel
             if hasattr(node, 'children'):
                 for child in node.children:
-                    res = find_item_exact(child)
-                    if res: return res
-            return None
-            
-        def find_item_fuzzy(node):
-            if hasattr(node, 'is_loadable') and node.is_loadable and name in node.name.lower(): return node
-            if hasattr(node, 'children'):
-                for child in node.children:
-                    res = find_item_fuzzy(child)
+                    res = find_r(child, target)
                     if res: return res
             return None
 
         found = None
-        for category in categories:
-            found = find_item_exact(category)
+        for cat in cats:
+            found = find_r(cat, name)
             if found: break
-            
-        if not found:
-            for category in categories:
-                found = find_item_fuzzy(category)
-                if found: break
-
-        if found:
-            self.application().view.selected_track = self.song().tracks[idx]
+        if found: 
             browser.load_item(found)
-            return "Loaded: " + str(found.name)
-            
-        return "Device '" + name + "' not found in Browser."
+            self.log_message("(AbletonMCP) Loaded Device: " + str(found.name))
 
-    # --- NOUVEAUTÉ V13 : CHARGER UN FICHIER AUDIO DEPUIS LA BIBLIOTHÈQUE ---
     def _load_sample(self, params):
-        t_idx = params.get("track_index")
-        c_idx = params.get("clip_index")
-        sample_name = params.get("sample_name", "").lower()
-        name = sample_name.strip()
-
-        browser = self.application().browser
-        
-        # On fouille spécifiquement dans "Bibliothèque utilisateur" et "Places" (dossiers ajoutés)
-        categories = [browser.user_library]
-        if hasattr(browser, 'user_folders'):
-            for folder in browser.user_folders:
-                categories.append(folder)
-        if hasattr(browser, 'packs'):
-            categories.append(browser.packs)
-
-        def find_item_exact(node):
-            if hasattr(node, 'is_loadable') and node.is_loadable and node.name.lower() == name: return node
+        name = str(params.get("sample_name", "")).lower().strip()
+        browser = Live.Application.get_application().browser
+        roots = [browser.samples, browser.user_library] + (list(browser.user_folders) if hasattr(browser, 'user_folders') else [])
+        def find_s(node, target):
+            if hasattr(node, 'is_loadable') and node.is_loadable:
+                if target in node.name.lower(): return node
             if hasattr(node, 'children'):
                 for child in node.children:
-                    res = find_item_exact(child)
+                    res = find_s(child, target)
                     if res: return res
             return None
-
-        def find_item_fuzzy(node):
-            if hasattr(node, 'is_loadable') and node.is_loadable and name in node.name.lower(): return node
-            if hasattr(node, 'children'):
-                for child in node.children:
-                    res = find_item_fuzzy(child)
-                    if res: return res
-            return None
-
         found = None
-        for category in categories:
-            found = find_item_exact(category)
+        for r in roots:
+            found = find_s(r, name)
             if found: break
-
-        if not found:
-            for category in categories:
-                found = find_item_fuzzy(category)
-                if found: break
-
         if found:
-            # On cible la piste et on sélectionne la bonne case (scene) pour y déposer l'audio
-            self.application().view.selected_track = self.song().tracks[t_idx]
-            try:
-                self.application().view.selected_scene = self.song().scenes[c_idx]
-            except: pass
-            
+            self.log_message("(AbletonMCP) FOUND SAMPLE: " + str(found.name))
             browser.load_item(found)
-            return "Sample chargé avec succès : " + str(found.name)
 
-        return "Sample '" + name + "' introuvable dans la Bibliothèque utilisateur ou les dossiers."
+    def _add_midi_notes(self, params):
+        clip = self.song().tracks[params.get("track_index")].clip_slots[params.get("clip_index")].clip
+        notes = [Live.Clip.MidiNoteSpecification(pitch=int(n['pitch']), start_time=float(n['start']), duration=float(n['dur']), velocity=int(n['vel'])) for n in params.get("notes", [])]
+        clip.add_new_notes(tuple(notes))
 
     def _set_device_param_by_name(self, params):
-        t_idx = params.get("track_index")
-        d_name = params.get("device_name").lower()
-        p_name = params.get("param_name").lower()
-        val = float(params.get("value"))
-        track = self.song().tracks[t_idx]
-        for dev in track.devices:
+        d_name, p_name, val = params.get("device_name").lower(), params.get("param_name").lower(), float(params.get("value"))
+        for dev in self.song().view.selected_track.devices:
             if d_name in dev.name.lower():
-                for param in dev.parameters:
-                    if p_name in param.name.lower():
-                        clamped_val = max(param.min, min(param.max, val))
-                        param.value = clamped_val
-                        return "Succès: " + str(param.name) + " réglé sur " + str(clamped_val)
-        return "Erreur: Plugin ou paramètre introuvable."
-
-    def _add_automation_by_name(self, params):
-        t_idx = params.get("track_index")
-        c_idx = params.get("clip_index")
-        d_name = params.get("device_name").lower()
-        p_name = params.get("param_name").lower()
-        points = params.get("points", [])
-        track = self.song().tracks[t_idx]
-        if not track.clip_slots[c_idx].has_clip: return "Erreur : Aucun clip."
-        clip = track.clip_slots[c_idx].clip
-        for dev in track.devices:
-            if d_name in dev.name.lower():
-                for param in dev.parameters:
-                    if p_name in param.name.lower():
-                        env = clip.automation_envelope(param)
-                        if env is None: return "Erreur création enveloppe"
-                        env.clear_all_events()
-                        for pt in points:
-                            time = float(pt.get("time", 0.0))
-                            norm_val = float(pt.get("value", 0.5))
-                            actual_val = param.min + (norm_val * (param.max - param.min))
-                            actual_val = max(param.min, min(param.max, actual_val))
-                            env.insert_step(time, actual_val)
-                        return "Automation ajoutée sur " + param.name
-        return "Erreur: Plugin/paramètre introuvable."
+                for p in dev.parameters:
+                    if p_name in p.name.lower():
+                        p.value = max(p.min, min(p.max, val))
+                        return True
